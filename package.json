@@ -3,6 +3,6 @@
   "private": true,
   "packageManager": "pnpm@10.15.0",
   "scripts": {
-    "dev": "pnpm --filter web dev"
+    "dev": "pnpm --filter web --filter server --parallel dev"
   }
 }
