@@ -11,6 +11,8 @@ import { useEffect, useRef, useState } from "react";
 type Point = { x: number; y: number };
 type Camera = { x: number; y: number; zoom: number };
 type Tool = "select" | "pencil" | "eraser" | "line" | "arrow" | "rect" | "diamond" | "ellipse" | "text";
+type PlacedStroke = { stroke: Stroke; index: number };
+type HistoryAction = { type: "add"; stroke: Stroke; index: number } | { type: "erase"; strokes: PlacedStroke[] };
 
 const COLORS = ["#f5f5f5", "#f43f5e", "#f59e0b", "#22c55e", "#38bdf8", "#a78bfa"];
 const WIDTHS = [3, 8];
@@ -23,8 +25,10 @@ const SOCKET_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:4000/ws";
 export function Board({ boardId }: { boardId: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const strokesRef = useRef<Stroke[]>([]);
-  const redoRef = useRef<Stroke[]>([]);
+  const undoRef = useRef<HistoryAction[]>([]);
+  const redoRef = useRef<HistoryAction[]>([]);
   const draftRef = useRef<Stroke | null>(null);
+  const eraseRef = useRef<{ pointerId: number; removed: PlacedStroke[] } | null>(null);
   const dragRef = useRef<{ snapshot: Stroke; origin: Point } | null>(null);
   const dragPreviewRef = useRef<Stroke | null>(null);
   const previewsRef = useRef<Map<string, Stroke>>(new Map());
@@ -39,10 +43,10 @@ export function Board({ boardId }: { boardId: string }) {
   const joinedRef = useRef(false);
   const identityRef = useRef({ id: "", name: "Guest", color: COLORS[0] });
   const lastCursorRef = useRef(0);
-  const textPlaceRef = useRef<{ x: number; y: number; fontSize: number } | null>(null);
+  const textPlaceRef = useRef<{ x: number; y: number; fontSize: number; color: string } | null>(null);
   const textIdRef = useRef("");
   const textInputRef = useRef<HTMLInputElement>(null);
-  const [textEditor, setTextEditor] = useState<{ id: string; color: string; fontSize: number } | null>(null);
+  const [textEditor, setTextEditor] = useState<{ id: string; color: string; fontSize: number; initial: string } | null>(null);
   const [color, setColor] = useState(COLORS[0]);
   const [width, setWidth] = useState(WIDTHS[0]);
   const [tool, setTool] = useState<Tool>("pencil");
@@ -68,8 +72,8 @@ export function Board({ boardId }: { boardId: string }) {
     const resize = () => {
       const dpr = window.devicePixelRatio || 1;
       const rect = canvas.getBoundingClientRect();
-      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      canvas.width = Math.max(1, Math.round(rect.width * dpr));
+      canvas.height = Math.max(1, Math.round(rect.height * dpr));
       redraw();
     };
 
@@ -83,15 +87,35 @@ export function Board({ boardId }: { boardId: string }) {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    let frame = 0;
+    let zoomFactor = 1;
+    let zoomScreen = { x: 0, y: 0 };
+    let panX = 0;
+    let panY = 0;
+    let zooming = false;
+    let panning = false;
+
+    const flush = () => {
+      frame = 0;
+      if (zooming) {
+        zoomAt(zoomScreen, zoomFactor);
+        zoomFactor = 1;
+        zooming = false;
+      }
+      if (panning) {
+        const camera = cameraRef.current;
+        cameraRef.current = { ...camera, x: camera.x - panX, y: camera.y - panY };
+        panX = 0;
+        panY = 0;
+        panning = false;
+        redraw();
+      }
+    };
+
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
       const rect = canvas.getBoundingClientRect();
       const screen = { x: event.clientX - rect.left, y: event.clientY - rect.top };
-      if (event.ctrlKey || event.metaKey) {
-        zoomAt(screen, Math.exp(-event.deltaY * 0.002));
-        return;
-      }
-
       let dx = event.deltaX;
       let dy = event.deltaY;
       if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
@@ -101,19 +125,29 @@ export function Board({ boardId }: { boardId: string }) {
         dx *= rect.width;
         dy *= rect.height;
       }
-      const camera = cameraRef.current;
-      cameraRef.current = { ...camera, x: camera.x - dx, y: camera.y - dy };
-      redraw();
+      if (event.ctrlKey || event.metaKey) {
+        zoomScreen = screen;
+        zoomFactor *= Math.exp(-dy * 0.0015);
+        zooming = true;
+      } else {
+        panX += dx;
+        panY += dy;
+        panning = true;
+      }
+      if (!frame) frame = window.requestAnimationFrame(flush);
     };
 
     const onMouseDown = (event: MouseEvent) => {
       if (event.button === 1) event.preventDefault();
     };
 
-    canvas.addEventListener("wheel", onWheel, { passive: false });
+    const board = canvas.parentElement;
+    if (!board) return;
+    board.addEventListener("wheel", onWheel, { passive: false });
     canvas.addEventListener("mousedown", onMouseDown);
     return () => {
-      canvas.removeEventListener("wheel", onWheel);
+      if (frame) window.cancelAnimationFrame(frame);
+      board.removeEventListener("wheel", onWheel);
       canvas.removeEventListener("mousedown", onMouseDown);
     };
   }, []);
@@ -159,7 +193,9 @@ export function Board({ boardId }: { boardId: string }) {
     if (!textEditor) return;
     const input = textInputRef.current;
     if (!input) return;
+    input.value = textEditor.initial;
     input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
     placeTextInput();
   }, [textEditor]);
 
@@ -198,6 +234,7 @@ export function Board({ boardId }: { boardId: string }) {
 
       if (message.data.type === "welcome") {
         strokesRef.current = message.data.strokes;
+        undoRef.current = message.data.strokes.map((stroke, index) => ({ type: "add", stroke, index }));
         redoRef.current = [];
         previewsRef.current = new Map();
         peersRef.current = new Map(message.data.peers.map((peer) => [peer.id, peer]));
@@ -236,8 +273,10 @@ export function Board({ boardId }: { boardId: string }) {
 
       if (message.data.type === "clear") {
         strokesRef.current = [];
+        undoRef.current = [];
         redoRef.current = [];
         draftRef.current = null;
+        eraseRef.current = null;
         previewsRef.current = new Map();
         syncHistory();
         redraw();
@@ -275,8 +314,50 @@ export function Board({ boardId }: { boardId: string }) {
   }, [boardId]);
 
   function syncHistory() {
-    setCanUndo(strokesRef.current.length > 0);
+    setCanUndo(undoRef.current.length > 0);
     setCanRedo(redoRef.current.length > 0);
+  }
+
+  function forgetStroke(strokeId: string) {
+    const clean = (actions: HistoryAction[]): HistoryAction[] => {
+      const next: HistoryAction[] = [];
+      for (const action of actions) {
+        if (action.type === "add") {
+          if (action.stroke.id !== strokeId) next.push(action);
+          continue;
+        }
+        const strokes = action.strokes.filter((item) => item.stroke.id !== strokeId);
+        if (strokes.length > 0) next.push({ type: "erase", strokes });
+      }
+      return next;
+    };
+    undoRef.current = clean(undoRef.current);
+    redoRef.current = clean(redoRef.current);
+  }
+
+  function patchHistoryStroke(stroke: Stroke) {
+    const patch = (action: HistoryAction): HistoryAction => {
+      if (action.type === "add") return action.stroke.id === stroke.id ? { ...action, stroke } : action;
+      return {
+        type: "erase",
+        strokes: action.strokes.map((item) => (item.stroke.id === stroke.id ? { ...item, stroke } : item)),
+      };
+    };
+    undoRef.current = undoRef.current.map(patch);
+    redoRef.current = redoRef.current.map(patch);
+  }
+
+  function rememberAdd(stroke: Stroke) {
+    const index = strokesRef.current.findIndex((item) => item.id === stroke.id);
+    undoRef.current = [...undoRef.current, { type: "add", stroke, index: index === -1 ? strokesRef.current.length : index }];
+    redoRef.current = [];
+  }
+
+  function insertStroke(placed: PlacedStroke) {
+    if (strokesRef.current.some((stroke) => stroke.id === placed.stroke.id)) return;
+    const next = strokesRef.current.slice();
+    next.splice(Math.max(0, Math.min(placed.index, next.length)), 0, placed.stroke);
+    strokesRef.current = next;
   }
 
   function send(message: ClientMessage) {
@@ -287,13 +368,16 @@ export function Board({ boardId }: { boardId: string }) {
 
   function applyRemoteStroke(stroke: Stroke) {
     const index = strokesRef.current.findIndex((item) => item.id === stroke.id);
-    if (index === -1) strokesRef.current = [...strokesRef.current, stroke];
-    else {
+    if (index === -1) {
+      forgetStroke(stroke.id);
+      strokesRef.current = [...strokesRef.current, stroke];
+      undoRef.current = [...undoRef.current, { type: "add", stroke, index: strokesRef.current.length - 1 }];
+    } else {
       const next = strokesRef.current.slice();
       next[index] = stroke;
       strokesRef.current = next;
+      patchHistoryStroke(stroke);
     }
-    redoRef.current = redoRef.current.filter((item) => item.id !== stroke.id);
     for (const [clientId, preview] of previewsRef.current) {
       if (preview.id === stroke.id) previewsRef.current.delete(clientId);
     }
@@ -303,7 +387,7 @@ export function Board({ boardId }: { boardId: string }) {
 
   function removeStroke(strokeId: string) {
     strokesRef.current = strokesRef.current.filter((stroke) => stroke.id !== strokeId);
-    redoRef.current = redoRef.current.filter((stroke) => stroke.id !== strokeId);
+    forgetStroke(strokeId);
   }
 
   function redraw() {
@@ -312,21 +396,26 @@ export function Board({ boardId }: { boardId: string }) {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const dpr = window.devicePixelRatio || 1;
+    const scale = canvas.width / Math.max(1, canvas.clientWidth);
     const camera = cameraRef.current;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
     ctx.fillStyle = BOARD_COLOR;
-    ctx.fillRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+    ctx.fillRect(0, 0, canvas.clientWidth + 1, canvas.clientHeight + 1);
     ctx.translate(camera.x, camera.y);
     ctx.scale(camera.zoom, camera.zoom);
 
     const hiddenId = dragRef.current?.snapshot.id;
+    const paint = (stroke: Stroke) => {
+      if (stroke.kind === "text") drawSharpText(ctx, stroke, camera, scale);
+      else drawStroke(ctx, stroke);
+    };
     for (const stroke of strokesRef.current) {
-      if (stroke.id !== hiddenId) drawStroke(ctx, stroke);
+      if (stroke.id === hiddenId || (textPlaceRef.current && stroke.id === textIdRef.current)) continue;
+      paint(stroke);
     }
-    if (dragPreviewRef.current) drawStroke(ctx, dragPreviewRef.current);
-    if (draftRef.current) drawStroke(ctx, draftRef.current);
-    for (const preview of previewsRef.current.values()) drawStroke(ctx, preview);
+    if (dragPreviewRef.current) paint(dragPreviewRef.current);
+    if (draftRef.current) paint(draftRef.current);
+    for (const preview of previewsRef.current.values()) paint(preview);
 
     placeTextInput();
 
@@ -350,7 +439,8 @@ export function Board({ boardId }: { boardId: string }) {
       x: screen.x - boardX * zoom,
       y: screen.y - boardY * zoom,
     };
-    setZoomPercent(Math.round(zoom * 100));
+    const percent = Math.round(zoom * 100);
+    setZoomPercent((current) => (current === percent ? current : percent));
     redraw();
   }
 
@@ -397,17 +487,37 @@ export function Board({ boardId }: { boardId: string }) {
       setGrabbing(true);
       return;
     }
-    if (event.button !== 0 || !joinedRef.current || draftRef.current || dragRef.current) return;
+    if (event.button !== 0 || !joinedRef.current || draftRef.current || dragRef.current || eraseRef.current) return;
 
     const point = toBoard(screen);
     publishCursor(point);
 
     if (toolRef.current === "text") {
       event.preventDefault();
-      commitText();
-      textPlaceRef.current = { x: point.x, y: point.y, fontSize: Math.max(18, widthRef.current * 6) };
+      const closed = commitText();
+      if (!closed) {
+        if (!pointInsideText(strokesRef.current, point) && textPlaceRef.current) {
+          textPlaceRef.current = { ...textPlaceRef.current, x: point.x, y: point.y };
+          placeTextInput();
+        }
+        return;
+      }
+      const existing = textAt(strokesRef.current, point);
+      if (existing) {
+        editText(existing);
+        return;
+      }
+      textPlaceRef.current = { x: point.x, y: point.y, fontSize: Math.max(18, widthRef.current * 6), color: colorRef.current };
       textIdRef.current = crypto.randomUUID();
-      setTextEditor({ id: textIdRef.current, color: colorRef.current, fontSize: textPlaceRef.current.fontSize });
+      setError("");
+      setTextEditor({ id: textIdRef.current, color: colorRef.current, fontSize: textPlaceRef.current.fontSize, initial: "" });
+      return;
+    }
+
+    if (toolRef.current === "eraser") {
+      capturePointer(event.currentTarget, event.pointerId);
+      eraseRef.current = { pointerId: event.pointerId, removed: [] };
+      eraseAt(point);
       return;
     }
 
@@ -423,7 +533,7 @@ export function Board({ boardId }: { boardId: string }) {
 
     const id = crypto.randomUUID();
     const tool = toolRef.current;
-    if (tool === "pencil" || tool === "eraser") {
+    if (tool === "pencil") {
       draftRef.current = {
         id,
         kind: tool,
@@ -465,6 +575,12 @@ export function Board({ boardId }: { boardId: string }) {
     const point = toBoard(screen);
     if (joinedRef.current) publishCursor(point);
 
+    const erase = eraseRef.current;
+    if (erase && erase.pointerId === event.pointerId) {
+      eraseAt(point);
+      return;
+    }
+
     const drag = dragRef.current;
     if (drag) {
       const moved = moveStroke(drag.snapshot, point.x - drag.origin.x, point.y - drag.origin.y);
@@ -476,9 +592,15 @@ export function Board({ boardId }: { boardId: string }) {
 
     const draft = draftRef.current;
     if (!draft) return;
-    if (draft.kind === "pencil" || draft.kind === "eraser") {
+    if (draft.kind === "pencil") {
       draft.points.push(point);
-    } else if (draft.kind !== "text") {
+    } else if (
+      draft.kind === "line" ||
+      draft.kind === "arrow" ||
+      draft.kind === "rect" ||
+      draft.kind === "diamond" ||
+      draft.kind === "ellipse"
+    ) {
       draft.width = point.x - draft.x;
       draft.height = point.y - draft.y;
     }
@@ -500,9 +622,21 @@ export function Board({ boardId }: { boardId: string }) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
 
+    if (eraseRef.current?.pointerId === event.pointerId) {
+      const removed = eraseRef.current.removed;
+      eraseRef.current = null;
+      if (removed.length > 0) {
+        undoRef.current = [...undoRef.current, { type: "erase", strokes: removed }];
+        redoRef.current = [];
+        syncHistory();
+      }
+      return;
+    }
+
     const drag = dragRef.current;
     if (drag) {
-      const moved = dragPreviewRef.current ?? drag.snapshot;
+      let moved = dragPreviewRef.current ?? drag.snapshot;
+      if (moved.kind === "text" && coversText(strokesRef.current, moved)) moved = drag.snapshot;
       const index = strokesRef.current.findIndex((stroke) => stroke.id === moved.id);
       if (index !== -1) {
         const next = strokesRef.current.slice();
@@ -512,6 +646,7 @@ export function Board({ boardId }: { boardId: string }) {
       dragRef.current = null;
       dragPreviewRef.current = null;
       publishPreview(null);
+      patchHistoryStroke(moved);
       publishStroke(moved);
       redraw();
       return;
@@ -521,24 +656,60 @@ export function Board({ boardId }: { boardId: string }) {
     if (!draft) return;
     draftRef.current = null;
     strokesRef.current = [...strokesRef.current, draft];
-    redoRef.current = [];
+    rememberAdd(draft);
     syncHistory();
     publishPreview(null);
     publishStroke(draft);
     redraw();
   }
 
+  function eraseAt(point: Point) {
+    const gesture = eraseRef.current;
+    if (!gesture) return;
+    let changed = false;
+    let hit = hitTest(strokesRef.current, point);
+    while (hit) {
+      const index = strokesRef.current.findIndex((stroke) => stroke.id === hit?.id);
+      const stroke = index === -1 ? undefined : strokesRef.current[index];
+      if (!stroke || index === -1) break;
+      strokesRef.current = strokesRef.current.filter((item) => item.id !== stroke.id);
+      gesture.removed.push({ stroke, index });
+      if (textIdRef.current === stroke.id) {
+        textPlaceRef.current = null;
+        setTextEditor(null);
+        setError("");
+      }
+      send({ type: "delete", boardId, strokeId: stroke.id });
+      changed = true;
+      hit = hitTest(strokesRef.current, point);
+    }
+    if (changed) redraw();
+  }
+
   function commitText(editorId?: string) {
-    if (editorId && editorId !== textIdRef.current) return;
+    if (editorId && editorId !== textIdRef.current) return true;
     const place = textPlaceRef.current;
     const input = textInputRef.current;
-    textPlaceRef.current = null;
-    if (!place || !input) return;
+    if (!place || !input) return true;
     const text = input.value.trim().slice(0, 200);
-    setTextEditor(null);
     if (!text) {
+      const id = textIdRef.current;
+      textPlaceRef.current = null;
+      setTextEditor(null);
+      setError("");
+      if (strokesRef.current.some((stroke) => stroke.id === id)) {
+        const index = strokesRef.current.findIndex((stroke) => stroke.id === id);
+        const existing = strokesRef.current[index];
+        strokesRef.current = strokesRef.current.filter((stroke) => stroke.id !== id);
+        if (existing && index !== -1) {
+          undoRef.current = [...undoRef.current, { type: "erase", strokes: [{ stroke: existing, index }] }];
+          redoRef.current = [];
+        }
+        syncHistory();
+        send({ type: "delete", boardId, strokeId: id });
+      }
       redraw();
-      return;
+      return true;
     }
     const stroke: Stroke = {
       id: textIdRef.current,
@@ -546,13 +717,50 @@ export function Board({ boardId }: { boardId: string }) {
       x: place.x,
       y: place.y,
       text,
-      color: colorRef.current,
+      color: place.color,
       fontSize: place.fontSize,
     };
-    strokesRef.current = [...strokesRef.current, stroke];
-    redoRef.current = [];
+    if (coversText(strokesRef.current, stroke)) {
+      setError("Text can't cover other text.");
+      return false;
+    }
+    textPlaceRef.current = null;
+    setTextEditor(null);
+    setError("");
+    const index = strokesRef.current.findIndex((item) => item.id === stroke.id);
+    if (index === -1) {
+      strokesRef.current = [...strokesRef.current, stroke];
+      rememberAdd(stroke);
+    } else {
+      const next = strokesRef.current.slice();
+      next[index] = stroke;
+      strokesRef.current = next;
+      patchHistoryStroke(stroke);
+    }
     syncHistory();
     publishStroke(stroke);
+    redraw();
+    return true;
+  }
+
+  function onDoubleClick(event: React.MouseEvent<HTMLCanvasElement>) {
+    if (!joinedRef.current) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const existing = textAt(strokesRef.current, toBoard({ x: event.clientX - rect.left, y: event.clientY - rect.top }));
+    if (!existing) return;
+    event.preventDefault();
+    dragRef.current = null;
+    dragPreviewRef.current = null;
+    if (!commitText()) return;
+    const current = strokesRef.current.find((stroke) => stroke.id === existing.id);
+    if (current?.kind === "text") editText(current);
+  }
+
+  function editText(stroke: Extract<Stroke, { kind: "text" }>) {
+    textPlaceRef.current = { x: stroke.x, y: stroke.y, fontSize: stroke.fontSize, color: stroke.color };
+    textIdRef.current = stroke.id;
+    setError("");
+    setTextEditor({ id: stroke.id, color: stroke.color, fontSize: stroke.fontSize, initial: stroke.text });
     redraw();
   }
 
@@ -561,37 +769,75 @@ export function Board({ boardId }: { boardId: string }) {
     const place = textPlaceRef.current;
     if (!input || !place) return;
     const camera = cameraRef.current;
-    input.style.left = `${place.x * camera.zoom + camera.x}px`;
-    input.style.top = `${place.y * camera.zoom + camera.y}px`;
-    input.style.fontSize = `${place.fontSize * camera.zoom}px`;
+    const size = Math.max(1, Math.round(place.fontSize * camera.zoom));
+    const width = Math.ceil(measureTextWidth(input.value || " ", place.fontSize) * camera.zoom) + 4;
+    input.style.left = `${Math.round(place.x * camera.zoom + camera.x)}px`;
+    input.style.top = `${Math.round(place.y * camera.zoom + camera.y)}px`;
+    input.style.fontSize = `${size}px`;
+    input.style.width = `${Math.max(width, size)}px`;
+    input.style.fontFamily = "sans-serif";
+  }
+
+  function keepCaretInView() {
+    const place = textPlaceRef.current;
+    const input = textInputRef.current;
+    const canvas = canvasRef.current;
+    if (!place || !input || !canvas) return;
+    placeTextInput();
+    const camera = cameraRef.current;
+    const caret = place.x * camera.zoom + camera.x + input.offsetWidth;
+    const limit = canvas.clientWidth - 32;
+    if (caret <= limit) return;
+    cameraRef.current = { ...camera, x: camera.x + (limit - caret) };
+    redraw();
   }
 
   function undo() {
-    const stroke = strokesRef.current.at(-1);
-    if (!stroke) return;
+    const action = undoRef.current.at(-1);
+    if (!action) return;
     draftRef.current = null;
-    strokesRef.current = strokesRef.current.slice(0, -1);
-    redoRef.current = [...redoRef.current, stroke];
+    undoRef.current = undoRef.current.slice(0, -1);
+    if (action.type === "add") {
+      const current = strokesRef.current.find((stroke) => stroke.id === action.stroke.id) ?? action.stroke;
+      strokesRef.current = strokesRef.current.filter((stroke) => stroke.id !== action.stroke.id);
+      redoRef.current = [...redoRef.current, { ...action, stroke: current }];
+      send({ type: "delete", boardId, strokeId: action.stroke.id });
+    } else {
+      for (const placed of [...action.strokes].reverse()) {
+        insertStroke(placed);
+        publishStroke(placed.stroke);
+      }
+      redoRef.current = [...redoRef.current, action];
+    }
     syncHistory();
     redraw();
-    send({ type: "delete", boardId, strokeId: stroke.id });
   }
 
   function redo() {
-    const stroke = redoRef.current.at(-1);
-    if (!stroke) return;
+    const action = redoRef.current.at(-1);
+    if (!action) return;
     draftRef.current = null;
     redoRef.current = redoRef.current.slice(0, -1);
-    strokesRef.current = [...strokesRef.current, stroke];
+    if (action.type === "add") {
+      insertStroke(action);
+      publishStroke(action.stroke);
+    } else {
+      for (const placed of action.strokes) {
+        strokesRef.current = strokesRef.current.filter((stroke) => stroke.id !== placed.stroke.id);
+        send({ type: "delete", boardId, strokeId: placed.stroke.id });
+      }
+    }
+    undoRef.current = [...undoRef.current, action];
     syncHistory();
     redraw();
-    publishStroke(stroke);
   }
 
   function clear() {
     strokesRef.current = [];
+    undoRef.current = [];
     redoRef.current = [];
     draftRef.current = null;
+    eraseRef.current = null;
     previewsRef.current = new Map();
     syncHistory();
     redraw();
@@ -621,6 +867,7 @@ export function Board({ boardId }: { boardId: string }) {
         onPointerMove={onPointerMove}
         onPointerUp={endPointer}
         onPointerCancel={endPointer}
+        onDoubleClick={onDoubleClick}
         onContextMenu={(event) => event.preventDefault()}
       />
       {textEditor ? (
@@ -629,8 +876,9 @@ export function Board({ boardId }: { boardId: string }) {
           ref={textInputRef}
           aria-label="Board text"
           data-editor-id={textEditor.id}
-          className="absolute z-10 min-w-4 bg-transparent outline-none"
+          className="absolute z-20 min-w-4 bg-transparent font-sans leading-none outline-none"
           style={{ color: textEditor.color, fontSize: textEditor.fontSize }}
+          onInput={keepCaretInView}
           onBlur={(event) => commitText(event.currentTarget.dataset.editorId)}
           onKeyDown={(event) => {
             event.stopPropagation();
@@ -641,20 +889,21 @@ export function Board({ boardId }: { boardId: string }) {
               event.preventDefault();
               textPlaceRef.current = null;
               setTextEditor(null);
+              redraw();
             }
           }}
         />
       ) : null}
-      <p className="absolute top-3 right-3 rounded-full bg-zinc-900/90 px-3 py-1 text-sm text-zinc-200 ring-1 ring-white/10">
+      <p className="absolute top-3 right-3 z-30 rounded-full bg-zinc-900 px-3 py-1 text-sm text-zinc-200 ring-1 ring-white/10">
         <span
           className={`mr-2 inline-block h-2 w-2 rounded-full ${connection === "live" && collab ? "bg-emerald-400" : "bg-zinc-500"}`}
         />
         {connection === "connecting" ? "Connecting" : connection === "offline" ? "Offline" : collab ? "Live" : "Private"}
       </p>
       {error ? (
-        <p className="absolute top-14 right-3 rounded-lg bg-rose-950 px-3 py-2 text-sm text-rose-100">{error}</p>
+        <p className="absolute top-14 right-3 z-30 rounded-lg bg-rose-950 px-3 py-2 text-sm text-rose-100">{error}</p>
       ) : null}
-      <div className="absolute top-3 left-3 flex max-w-[calc(100%-8rem)] flex-wrap items-center gap-2 rounded-xl bg-zinc-900/90 p-2 shadow-lg ring-1 ring-white/10">
+      <div className="absolute top-3 left-1/2 z-30 flex -translate-x-1/2 flex-nowrap items-center justify-center gap-2 rounded-xl bg-zinc-900 p-2.5 shadow-lg ring-1 ring-white/10">
         {TOOLS.map((item) => (
           <button
             key={item}
@@ -668,7 +917,7 @@ export function Board({ boardId }: { boardId: string }) {
             <ToolbarIcon name={item} />
           </button>
         ))}
-        <span className="mx-1 h-6 w-px bg-white/15" />
+        <span className="mx-1 h-7 w-px shrink-0 bg-white/15" />
         {COLORS.map((swatch) => (
           <button
             key={swatch}
@@ -676,11 +925,11 @@ export function Board({ boardId }: { boardId: string }) {
             aria-label={`Stroke color ${swatch}`}
             aria-pressed={color === swatch}
             onClick={() => setColor(swatch)}
-            className={`h-7 w-7 rounded-full ${color === swatch ? "ring-2 ring-white ring-offset-2 ring-offset-zinc-900" : ""}`}
+            className={`h-9 w-9 shrink-0 rounded-full ${color === swatch ? "ring-2 ring-white ring-offset-2 ring-offset-zinc-900" : ""}`}
             style={{ backgroundColor: swatch }}
           />
         ))}
-        <span className="mx-1 h-6 w-px bg-white/15" />
+        <span className="mx-1 h-7 w-px shrink-0 bg-white/15" />
         {WIDTHS.map((strokeWidth) => (
           <button
             key={strokeWidth}
@@ -688,12 +937,12 @@ export function Board({ boardId }: { boardId: string }) {
             aria-label={strokeWidth === WIDTHS[0] ? "Thin stroke" : "Thick stroke"}
             aria-pressed={width === strokeWidth}
             onClick={() => setWidth(strokeWidth)}
-            className={`flex h-7 w-9 items-center justify-center rounded-md ${width === strokeWidth ? "bg-white/15" : "hover:bg-white/10"}`}
+            className={`flex h-10 w-12 shrink-0 items-center justify-center rounded-md ${width === strokeWidth ? "bg-white/15" : "hover:bg-white/10"}`}
           >
             <span className="block w-5 rounded-full bg-white" style={{ height: strokeWidth }} />
           </button>
         ))}
-        <span className="mx-1 h-6 w-px bg-white/15" />
+        <span className="mx-1 h-7 w-px shrink-0 bg-white/15" />
         <button type="button" aria-label="Undo" title="Undo" onClick={undo} disabled={!canUndo} className={iconButton}>
           <ToolbarIcon name="undo" />
         </button>
@@ -718,7 +967,7 @@ export function Board({ boardId }: { boardId: string }) {
             {copied ? "Copied" : "Copy link"}
           </button>
         ) : null}
-        <span className="mx-1 h-6 w-px bg-white/15" />
+        <span className="mx-1 h-7 w-px shrink-0 bg-white/15" />
         <button type="button" aria-label="Zoom out" onClick={() => zoomAt(viewportCenter(), 1 / 1.1)} className={toolButton}>
           −
         </button>
@@ -741,10 +990,10 @@ export function Board({ boardId }: { boardId: string }) {
 }
 
 const toolButton =
-  "rounded-md px-2 py-1 text-sm text-zinc-200 capitalize hover:bg-white/10 disabled:cursor-not-allowed disabled:text-zinc-500 disabled:hover:bg-transparent";
+  "shrink-0 whitespace-nowrap rounded-md px-3 py-2 text-base text-zinc-200 capitalize hover:bg-white/10 disabled:cursor-not-allowed disabled:text-zinc-500 disabled:hover:bg-transparent";
 
 const iconButton =
-  "flex h-8 w-8 items-center justify-center rounded-md text-zinc-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:text-zinc-500 disabled:hover:bg-transparent";
+  "flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-zinc-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:text-zinc-500 disabled:hover:bg-transparent";
 
 const TOOL_LABELS: Record<Tool, string> = {
   select: "Select",
@@ -760,7 +1009,7 @@ const TOOL_LABELS: Record<Tool, string> = {
 
 function ToolbarIcon({ name }: { name: Tool | "undo" | "redo" }) {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+    <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
       {name === "select" ? <path d="M5 3.5v12.4l3.4-3.2 2.2 6.1 2.2-.8-2.3-6.1H16.5L5 3.5z" /> : null}
       {name === "pencil" ? (
         <>
@@ -830,13 +1079,7 @@ function drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke) {
     drawPencil(ctx, stroke.points, stroke.color, stroke.width);
     return;
   }
-  if (stroke.kind === "text") {
-    ctx.fillStyle = stroke.color;
-    ctx.font = `${stroke.fontSize}px sans-serif`;
-    ctx.textBaseline = "top";
-    ctx.fillText(stroke.text, stroke.x, stroke.y);
-    return;
-  }
+  if (stroke.kind === "text") return;
 
   ctx.strokeStyle = stroke.color;
   ctx.lineWidth = stroke.strokeWidth;
@@ -883,6 +1126,22 @@ function drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke) {
   ctx.beginPath();
   ctx.ellipse(x + width / 2, y + height / 2, Math.max(width / 2, 0.01), Math.max(height / 2, 0.01), 0, 0, Math.PI * 2);
   ctx.stroke();
+}
+
+function drawSharpText(
+  ctx: CanvasRenderingContext2D,
+  stroke: Extract<Stroke, { kind: "text" }>,
+  camera: { x: number; y: number; zoom: number },
+  scale: number,
+) {
+  const transform = ctx.getTransform();
+  const size = Math.max(1, Math.round(stroke.fontSize * camera.zoom));
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.font = `${size}px sans-serif`;
+  ctx.fillStyle = stroke.color;
+  ctx.textBaseline = "top";
+  ctx.fillText(stroke.text, Math.round(stroke.x * camera.zoom + camera.x), Math.round(stroke.y * camera.zoom + camera.y));
+  ctx.setTransform(transform);
 }
 
 function drawPencil(
@@ -942,14 +1201,58 @@ function hits(stroke: Stroke, point: Point) {
     );
   }
   if (stroke.kind === "text") {
-    const width = Math.max(stroke.fontSize, stroke.text.length * stroke.fontSize * 0.55);
-    return point.x >= stroke.x - 6 && point.x <= stroke.x + width + 6 && point.y >= stroke.y - 6 && point.y <= stroke.y + stroke.fontSize + 6;
+    const box = textBounds(stroke);
+    return point.x >= box.x - 6 && point.x <= box.x + box.width + 6 && point.y >= box.y - 6 && point.y <= box.y + box.height + 6;
   }
   const x = Math.min(stroke.x, stroke.x + stroke.width) - 6;
   const y = Math.min(stroke.y, stroke.y + stroke.height) - 6;
   const width = Math.abs(stroke.width) + 12;
   const height = Math.abs(stroke.height) + 12;
   return point.x >= x && point.x <= x + width && point.y >= y && point.y <= y + height;
+}
+
+function textBounds(stroke: { x: number; y: number; text: string; fontSize: number }) {
+  const width = measureTextWidth(stroke.text, stroke.fontSize);
+  return { x: stroke.x, y: stroke.y, width, height: stroke.fontSize };
+}
+
+let textMeasure: CanvasRenderingContext2D | null = null;
+
+function measureTextWidth(text: string, fontSize: number) {
+  if (!textMeasure) textMeasure = document.createElement("canvas").getContext("2d");
+  if (!textMeasure) return text.length * fontSize * 0.55;
+  textMeasure.font = `${fontSize}px sans-serif`;
+  return textMeasure.measureText(text).width;
+}
+
+function coversText(strokes: Stroke[], next: Extract<Stroke, { kind: "text" }>) {
+  const box = textBounds(next);
+  return strokes.some(
+    (stroke) => stroke.kind === "text" && stroke.id !== next.id && boxesOverlap(box, textBounds(stroke)),
+  );
+}
+
+function pointInsideText(strokes: Stroke[], point: Point) {
+  return textAt(strokes, point) !== null;
+}
+
+function textAt(strokes: Stroke[], point: Point) {
+  for (let index = strokes.length - 1; index >= 0; index -= 1) {
+    const stroke = strokes[index];
+    if (stroke?.kind === "text" && pointInBox(point, textBounds(stroke))) return stroke;
+  }
+  return null;
+}
+
+function boxesOverlap(
+  a: { x: number; y: number; width: number; height: number },
+  b: { x: number; y: number; width: number; height: number },
+) {
+  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+}
+
+function pointInBox(point: Point, box: { x: number; y: number; width: number; height: number }) {
+  return point.x >= box.x && point.x <= box.x + box.width && point.y >= box.y && point.y <= box.y + box.height;
 }
 
 function distanceToSegment(point: Point, start: Point, end: Point) {
