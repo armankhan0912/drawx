@@ -31,15 +31,29 @@ const boxFields = {
 };
 
 export const rectStrokeSchema = z.object({ ...boxFields, kind: z.literal("rect") });
+export const diamondStrokeSchema = z.object({ ...boxFields, kind: z.literal("diamond") });
 export const ellipseStrokeSchema = z.object({ ...boxFields, kind: z.literal("ellipse") });
 export const lineStrokeSchema = z.object({ ...boxFields, kind: z.literal("line") });
+export const arrowStrokeSchema = z.object({ ...boxFields, kind: z.literal("arrow") });
+export const textStrokeSchema = z.object({
+  id: idSchema,
+  kind: z.literal("text"),
+  x: z.number(),
+  y: z.number(),
+  text: z.string().min(1).max(200),
+  color: colorSchema,
+  fontSize: z.number().positive(),
+});
 
 export const strokeSchema = z.discriminatedUnion("kind", [
   pencilStrokeSchema,
   eraserStrokeSchema,
   rectStrokeSchema,
+  diamondStrokeSchema,
   ellipseStrokeSchema,
   lineStrokeSchema,
+  arrowStrokeSchema,
+  textStrokeSchema,
 ]);
 
 export const peerSchema = z.object({

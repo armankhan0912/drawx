@@ -10,11 +10,11 @@ import { useEffect, useRef, useState } from "react";
 
 type Point = { x: number; y: number };
 type Camera = { x: number; y: number; zoom: number };
-type Tool = "select" | "pencil" | "eraser" | "line" | "rect" | "ellipse";
+type Tool = "select" | "pencil" | "eraser" | "line" | "arrow" | "rect" | "diamond" | "ellipse" | "text";
 
 const COLORS = ["#f5f5f5", "#f43f5e", "#f59e0b", "#22c55e", "#38bdf8", "#a78bfa"];
 const WIDTHS = [3, 8];
-const TOOLS: Tool[] = ["select", "pencil", "eraser", "line", "rect", "ellipse"];
+const TOOLS: Tool[] = ["select", "pencil", "eraser", "line", "arrow", "rect", "diamond", "ellipse", "text"];
 const BOARD_COLOR = "#111111";
 const MIN_ZOOM = 0.2;
 const MAX_ZOOM = 8;
@@ -39,6 +39,10 @@ export function Board({ boardId }: { boardId: string }) {
   const joinedRef = useRef(false);
   const identityRef = useRef({ id: "", name: "Guest", color: COLORS[0] });
   const lastCursorRef = useRef(0);
+  const textPlaceRef = useRef<{ x: number; y: number; fontSize: number } | null>(null);
+  const textIdRef = useRef("");
+  const textInputRef = useRef<HTMLInputElement>(null);
+  const [textEditor, setTextEditor] = useState<{ id: string; color: string; fontSize: number } | null>(null);
   const [color, setColor] = useState(COLORS[0]);
   const [width, setWidth] = useState(WIDTHS[0]);
   const [tool, setTool] = useState<Tool>("pencil");
@@ -116,6 +120,8 @@ export function Board({ boardId }: { boardId: string }) {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return;
       if (event.code === "Space") {
         event.preventDefault();
         spaceRef.current = true;
@@ -148,6 +154,14 @@ export function Board({ boardId }: { boardId: string }) {
       window.removeEventListener("keyup", onKeyUp);
     };
   }, []);
+
+  useEffect(() => {
+    if (!textEditor) return;
+    const input = textInputRef.current;
+    if (!input) return;
+    input.focus();
+    placeTextInput();
+  }, [textEditor]);
 
   useEffect(() => {
     identityRef.current = clientIdentity();
@@ -314,6 +328,8 @@ export function Board({ boardId }: { boardId: string }) {
     if (draftRef.current) drawStroke(ctx, draftRef.current);
     for (const preview of previewsRef.current.values()) drawStroke(ctx, preview);
 
+    placeTextInput();
+
     for (const peer of peersRef.current.values()) {
       ctx.fillStyle = peer.color;
       ctx.beginPath();
@@ -385,6 +401,16 @@ export function Board({ boardId }: { boardId: string }) {
 
     const point = toBoard(screen);
     publishCursor(point);
+
+    if (toolRef.current === "text") {
+      event.preventDefault();
+      commitText();
+      textPlaceRef.current = { x: point.x, y: point.y, fontSize: Math.max(18, widthRef.current * 6) };
+      textIdRef.current = crypto.randomUUID();
+      setTextEditor({ id: textIdRef.current, color: colorRef.current, fontSize: textPlaceRef.current.fontSize });
+      return;
+    }
+
     capturePointer(event.currentTarget, event.pointerId);
 
     if (toolRef.current === "select") {
@@ -396,18 +422,19 @@ export function Board({ boardId }: { boardId: string }) {
     }
 
     const id = crypto.randomUUID();
-    if (toolRef.current === "pencil" || toolRef.current === "eraser") {
+    const tool = toolRef.current;
+    if (tool === "pencil" || tool === "eraser") {
       draftRef.current = {
         id,
-        kind: toolRef.current,
+        kind: tool,
         points: [point],
         color: colorRef.current,
         width: widthRef.current,
       };
-    } else {
+    } else if (tool === "line" || tool === "arrow" || tool === "rect" || tool === "diamond" || tool === "ellipse") {
       draftRef.current = {
         id,
-        kind: toolRef.current,
+        kind: tool,
         x: point.x,
         y: point.y,
         width: 0,
@@ -451,7 +478,7 @@ export function Board({ boardId }: { boardId: string }) {
     if (!draft) return;
     if (draft.kind === "pencil" || draft.kind === "eraser") {
       draft.points.push(point);
-    } else {
+    } else if (draft.kind !== "text") {
       draft.width = point.x - draft.x;
       draft.height = point.y - draft.y;
     }
@@ -499,6 +526,44 @@ export function Board({ boardId }: { boardId: string }) {
     publishPreview(null);
     publishStroke(draft);
     redraw();
+  }
+
+  function commitText(editorId?: string) {
+    if (editorId && editorId !== textIdRef.current) return;
+    const place = textPlaceRef.current;
+    const input = textInputRef.current;
+    textPlaceRef.current = null;
+    if (!place || !input) return;
+    const text = input.value.trim().slice(0, 200);
+    setTextEditor(null);
+    if (!text) {
+      redraw();
+      return;
+    }
+    const stroke: Stroke = {
+      id: textIdRef.current,
+      kind: "text",
+      x: place.x,
+      y: place.y,
+      text,
+      color: colorRef.current,
+      fontSize: place.fontSize,
+    };
+    strokesRef.current = [...strokesRef.current, stroke];
+    redoRef.current = [];
+    syncHistory();
+    publishStroke(stroke);
+    redraw();
+  }
+
+  function placeTextInput() {
+    const input = textInputRef.current;
+    const place = textPlaceRef.current;
+    if (!input || !place) return;
+    const camera = cameraRef.current;
+    input.style.left = `${place.x * camera.zoom + camera.x}px`;
+    input.style.top = `${place.y * camera.zoom + camera.y}px`;
+    input.style.fontSize = `${place.fontSize * camera.zoom}px`;
   }
 
   function undo() {
@@ -558,6 +623,28 @@ export function Board({ boardId }: { boardId: string }) {
         onPointerCancel={endPointer}
         onContextMenu={(event) => event.preventDefault()}
       />
+      {textEditor ? (
+        <input
+          key={textEditor.id}
+          ref={textInputRef}
+          aria-label="Board text"
+          data-editor-id={textEditor.id}
+          className="absolute z-10 min-w-4 bg-transparent outline-none"
+          style={{ color: textEditor.color, fontSize: textEditor.fontSize }}
+          onBlur={(event) => commitText(event.currentTarget.dataset.editorId)}
+          onKeyDown={(event) => {
+            event.stopPropagation();
+            if (event.key === "Enter") {
+              event.preventDefault();
+              commitText();
+            } else if (event.key === "Escape") {
+              event.preventDefault();
+              textPlaceRef.current = null;
+              setTextEditor(null);
+            }
+          }}
+        />
+      ) : null}
       <p className="absolute top-3 right-3 rounded-full bg-zinc-900/90 px-3 py-1 text-sm text-zinc-200 ring-1 ring-white/10">
         <span
           className={`mr-2 inline-block h-2 w-2 rounded-full ${connection === "live" && collab ? "bg-emerald-400" : "bg-zinc-500"}`}
@@ -572,11 +659,13 @@ export function Board({ boardId }: { boardId: string }) {
           <button
             key={item}
             type="button"
+            aria-label={TOOL_LABELS[item]}
+            title={TOOL_LABELS[item]}
             aria-pressed={tool === item}
             onClick={() => setTool(item)}
-            className={`${toolButton} capitalize ${tool === item ? "bg-white/15" : ""}`}
+            className={`${iconButton} ${tool === item ? "bg-white/15" : ""}`}
           >
-            {item}
+            <ToolbarIcon name={item} />
           </button>
         ))}
         <span className="mx-1 h-6 w-px bg-white/15" />
@@ -605,11 +694,11 @@ export function Board({ boardId }: { boardId: string }) {
           </button>
         ))}
         <span className="mx-1 h-6 w-px bg-white/15" />
-        <button type="button" onClick={undo} disabled={!canUndo} className={toolButton}>
-          Undo
+        <button type="button" aria-label="Undo" title="Undo" onClick={undo} disabled={!canUndo} className={iconButton}>
+          <ToolbarIcon name="undo" />
         </button>
-        <button type="button" onClick={redo} disabled={!canRedo} className={toolButton}>
-          Redo
+        <button type="button" aria-label="Redo" title="Redo" onClick={redo} disabled={!canRedo} className={iconButton}>
+          <ToolbarIcon name="redo" />
         </button>
         <button type="button" onClick={clear} className={toolButton}>
           Clear
@@ -654,6 +743,69 @@ export function Board({ boardId }: { boardId: string }) {
 const toolButton =
   "rounded-md px-2 py-1 text-sm text-zinc-200 capitalize hover:bg-white/10 disabled:cursor-not-allowed disabled:text-zinc-500 disabled:hover:bg-transparent";
 
+const iconButton =
+  "flex h-8 w-8 items-center justify-center rounded-md text-zinc-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:text-zinc-500 disabled:hover:bg-transparent";
+
+const TOOL_LABELS: Record<Tool, string> = {
+  select: "Select",
+  pencil: "Pencil",
+  eraser: "Eraser",
+  line: "Line",
+  arrow: "Arrow",
+  rect: "Rectangle",
+  diamond: "Diamond",
+  ellipse: "Ellipse",
+  text: "Text",
+};
+
+function ToolbarIcon({ name }: { name: Tool | "undo" | "redo" }) {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+      {name === "select" ? <path d="M5 3.5v12.4l3.4-3.2 2.2 6.1 2.2-.8-2.3-6.1H16.5L5 3.5z" /> : null}
+      {name === "pencil" ? (
+        <>
+          <path d="M14 5.2 18.8 10 9 19.8H4.2V15z" />
+          <path d="M12.6 6.6 17.4 11.4" />
+        </>
+      ) : null}
+      {name === "eraser" ? (
+        <>
+          <path d="M4.5 14.5 11 5.5l8 6.2-6.5 8.3H8.2z" />
+          <path d="m9.2 12.2 4.6 3.6" />
+        </>
+      ) : null}
+      {name === "line" ? <path d="M5 19 19 5" /> : null}
+      {name === "arrow" ? (
+        <>
+          <path d="M5 18 18 6" />
+          <path d="M10 6h8v8" />
+        </>
+      ) : null}
+      {name === "rect" ? <rect x="5" y="6" width="14" height="12" rx="1.5" /> : null}
+      {name === "diamond" ? <path d="M12 4 20 12 12 20 4 12Z" /> : null}
+      {name === "ellipse" ? <ellipse cx="12" cy="12" rx="7.5" ry="6.5" /> : null}
+      {name === "text" ? (
+        <>
+          <path d="M5 6h14" />
+          <path d="M12 6v13" />
+        </>
+      ) : null}
+      {name === "undo" ? (
+        <>
+          <path d="M8 8h7.5a4.5 4.5 0 0 1 0 9H9" />
+          <path d="M11 5 7 8l4 3" />
+        </>
+      ) : null}
+      {name === "redo" ? (
+        <>
+          <path d="M16 8H8.5a4.5 4.5 0 0 0 0 9H15" />
+          <path d="m13 5 4 3-4 3" />
+        </>
+      ) : null}
+    </svg>
+  );
+}
+
 function clientIdentity() {
   let id = localStorage.getItem("drawx-client");
   if (!id) {
@@ -678,16 +830,35 @@ function drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke) {
     drawPencil(ctx, stroke.points, stroke.color, stroke.width);
     return;
   }
+  if (stroke.kind === "text") {
+    ctx.fillStyle = stroke.color;
+    ctx.font = `${stroke.fontSize}px sans-serif`;
+    ctx.textBaseline = "top";
+    ctx.fillText(stroke.text, stroke.x, stroke.y);
+    return;
+  }
 
   ctx.strokeStyle = stroke.color;
   ctx.lineWidth = stroke.strokeWidth;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  if (stroke.kind === "line") {
+
+  if (stroke.kind === "line" || stroke.kind === "arrow") {
+    const end = { x: stroke.x + stroke.width, y: stroke.y + stroke.height };
     ctx.beginPath();
     ctx.moveTo(stroke.x, stroke.y);
-    ctx.lineTo(stroke.x + stroke.width, stroke.y + stroke.height);
+    ctx.lineTo(end.x, end.y);
     ctx.stroke();
+    if (stroke.kind === "arrow") {
+      const angle = Math.atan2(stroke.height, stroke.width);
+      const head = Math.max(14, stroke.strokeWidth * 4);
+      ctx.beginPath();
+      ctx.moveTo(end.x, end.y);
+      ctx.lineTo(end.x - head * Math.cos(angle - 0.45), end.y - head * Math.sin(angle - 0.45));
+      ctx.moveTo(end.x, end.y);
+      ctx.lineTo(end.x - head * Math.cos(angle + 0.45), end.y - head * Math.sin(angle + 0.45));
+      ctx.stroke();
+    }
     return;
   }
 
@@ -697,6 +868,16 @@ function drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke) {
   const height = Math.abs(stroke.height);
   if (stroke.kind === "rect") {
     ctx.strokeRect(x, y, width, height);
+    return;
+  }
+  if (stroke.kind === "diamond") {
+    ctx.beginPath();
+    ctx.moveTo(x + width / 2, y);
+    ctx.lineTo(x + width, y + height / 2);
+    ctx.lineTo(x + width / 2, y + height);
+    ctx.lineTo(x, y + height / 2);
+    ctx.closePath();
+    ctx.stroke();
     return;
   }
   ctx.beginPath();
@@ -754,11 +935,15 @@ function hits(stroke: Stroke, point: Point) {
     }
     return false;
   }
-  if (stroke.kind === "line") {
+  if (stroke.kind === "line" || stroke.kind === "arrow") {
     return (
       distanceToSegment(point, { x: stroke.x, y: stroke.y }, { x: stroke.x + stroke.width, y: stroke.y + stroke.height }) <=
       stroke.strokeWidth / 2 + 6
     );
+  }
+  if (stroke.kind === "text") {
+    const width = Math.max(stroke.fontSize, stroke.text.length * stroke.fontSize * 0.55);
+    return point.x >= stroke.x - 6 && point.x <= stroke.x + width + 6 && point.y >= stroke.y - 6 && point.y <= stroke.y + stroke.fontSize + 6;
   }
   const x = Math.min(stroke.x, stroke.x + stroke.width) - 6;
   const y = Math.min(stroke.y, stroke.y + stroke.height) - 6;
